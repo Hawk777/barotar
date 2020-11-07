@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import gzip
+import io
+import pathlib
+import struct
+
+
+_u32 = struct.Struct("<I")
+
+
+def _read_save(savefile: pathlib.Path, extract_contents: bool):
+    with gzip.open(savefile) as fp:
+        while True:
+            name_length = fp.read(4)
+            if name_length == B"":
+                break
+            elif len(name_length) != 4:
+                raise EOFError("EOF inside filename length")
+            name_length = _u32.unpack(name_length)[0]
+
+            name = fp.read(2 * name_length)
+            if len(name) != 2 * name_length:
+                raise EOFError("EOF inside filename")
+            name = name.decode("UTF-16LE")
+            name = pathlib.Path(name)
+            if len(name.parts) < 1:
+                raise ValueError("Empty filename")
+            if any(i in (".", "..") for i in name.parts):
+                raise ValueError(f". or .. component in filename {name}")
+
+            data_length = fp.read(4)
+            if len(data_length) != 4:
+                raise EOFError("EOF inside file data length")
+            data_length = _u32.unpack(data_length)[0]
+
+            print(f"{name} ({data_length} bytes)")
+
+            if extract_contents:
+                name.parent.mkdir(parents=True, exist_ok=True)
+                with name.open(mode="wb") as outfp:
+                    while data_length != 0:
+                        chunk = fp.read(min(data_length, io.DEFAULT_BUFFER_SIZE))
+                        if chunk == B"":
+                            raise EOFError("EOF inside file data")
+                        outfp.write(chunk)
+                        data_length -= len(chunk)
+            else:
+                while data_length != 0:
+                    chunk = fp.read(min(data_length, io.DEFAULT_BUFFER_SIZE))
+                    if chunk == B"":
+                        raise EOFError("EOF inside file data")
+                    data_length -= len(chunk)
+
+
+def _list_contents(savefile: pathlib.Path):
+    _read_save(savefile, False)
+
+
+def _extract_contents(savefile: pathlib.Path):
+    _read_save(savefile, True)
+
+
+def _create_save(savefile: pathlib.Path):
+    with savefile.open("wb") as fp:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=fp, mtime=0) as fp:
+            pending_directories = collections.deque()
+            pending_directories.append(pathlib.Path("."))
+            while pending_directories:
+                for child in pending_directories.popleft().iterdir():
+                    if child.is_file():
+                        name = str(child).encode("UTF-16LE")
+                        assert len(name) % 2 == 0, "Bad UTF-16 encoding"
+                        fp.write(_u32.pack(len(name) // 2))
+                        fp.write(name)
+                        data_length = child.stat().st_size
+                        fp.write(_u32.pack(data_length))
+                        print(f"{child} ({data_length} bytes)")
+                        with child.open("rb") as infp:
+                            while data_length:
+                                chunk = infp.read(min(data_length, io.DEFAULT_BUFFER_SIZE))
+                                if not chunk:
+                                    raise EOFError(f"File {child} resized during read")
+                                fp.write(chunk)
+                                data_length -= len(chunk)
+                    elif child.is_dir():
+                        pending_directories.append(child)
+                    else:
+                        print(f"{child} skipped: neither file nor directory")
+
+
+def main():
+    main_parser = argparse.ArgumentParser(description="Examine, unpack, or pack Barotrauma save files")
+    sub_parsers = main_parser.add_subparsers(required=True, dest="cmd")
+    sub_parser = sub_parsers.add_parser("list", aliases=["t"], description="List contents of a save file")
+    sub_parser.set_defaults(func=_list_contents)
+    sub_parser.add_argument("savefile", type=pathlib.Path, help="the save file to list")
+    sub_parser = sub_parsers.add_parser("extract", aliases=["x"], description="Extract contents of a save file to the current directory")
+    sub_parser.set_defaults(func=_extract_contents)
+    sub_parser.add_argument("savefile", type=pathlib.Path, help="the save file to extract")
+    sub_parser = sub_parsers.add_parser("create", aliases=["c"], description="Pack contents of the current directory into a save file")
+    sub_parser.set_defaults(func=_create_save)
+    sub_parser.add_argument("savefile", type=pathlib.Path, help="the save file to create")
+    args = main_parser.parse_args()
+    args.func(args.savefile)
+
+
+if __name__ == "__main__":
+    main()
